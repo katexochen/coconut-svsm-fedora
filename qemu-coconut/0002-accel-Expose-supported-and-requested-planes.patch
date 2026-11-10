@@ -1,0 +1,119 @@
+From dad51ded9d7e281c93a23bb3073cf55107d24199 Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <joerg.roedel@amd.com>
+Date: Thu, 20 Aug 2026 16:51:05 +0200
+Subject: [PATCH 02/20] accel: Expose supported and requested planes
+
+Add accelerator hooks to query the number of supported planes and to
+notify the accelerator when a plane is referenced. Default to one
+supported plane and make request notifications optional.
+
+Implement the KVM query with KVM_CAP_PLANES and clamp the result to
+KVM_MAX_PLANES.
+---
+ accel/accel-system.c      | 16 ++++++++++++++++
+ accel/kvm/kvm-all.c       | 13 +++++++++++++
+ include/accel/accel-ops.h |  2 ++
+ include/qemu/accel.h      | 18 ++++++++++++++++++
+ 4 files changed, 49 insertions(+)
+
+diff --git a/accel/accel-system.c b/accel/accel-system.c
+index 9176665202..209c6ffc48 100644
+--- a/accel/accel-system.c
++++ b/accel/accel-system.c
+@@ -76,6 +76,22 @@ void accel_pre_resume(MachineState *ms, bool step_pending)
+     }
+ }
+ 
++unsigned int accel_num_planes(AccelState *accel)
++{
++    AccelClass *acc = ACCEL_GET_CLASS(accel);
++
++    return acc->num_planes ? acc->num_planes(accel) : 1;
++}
++
++void accel_request_plane(AccelState *accel, unsigned int id)
++{
++    AccelClass *acc = ACCEL_GET_CLASS(accel);
++
++    if (acc->request_plane) {
++        acc->request_plane(accel, id);
++    }
++}
++
+ /* initialize the arch-independent accel operation interfaces */
+ void accel_init_ops_interfaces(AccelClass *ac)
+ {
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 83cbd120a8..3e2759c6df 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -4097,6 +4097,18 @@ static bool kvm_accel_has_memory(AccelState *accel, AddressSpace *as,
+     return false;
+ }
+ 
++static unsigned int kvm_accel_num_planes(AccelState *accel)
++{
++    KVMState *s = KVM_STATE(accel);
++    int count = kvm_vm_check_extension(s, KVM_CAP_PLANES);
++
++    if (count < 1) {
++        return 1;
++    }
++
++    return MIN((unsigned int)count, (unsigned int)KVM_MAX_PLANES);
++}
++
+ static void kvm_get_kvm_shadow_mem(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+@@ -4276,6 +4288,7 @@ static void kvm_accel_class_init(ObjectClass *oc, const void *data)
+     ac->init_machine = kvm_init;
+     ac->rebuild_guest = kvm_reset_vmfd;
+     ac->has_memory = kvm_accel_has_memory;
++    ac->num_planes = kvm_accel_num_planes;
+     ac->allowed = &kvm_allowed;
+ 
+     object_class_property_add(oc, "kernel-irqchip", "on|off|split",
+diff --git a/include/accel/accel-ops.h b/include/accel/accel-ops.h
+index 9f3f329c44..57ed7a534d 100644
+--- a/include/accel/accel-ops.h
++++ b/include/accel/accel-ops.h
+@@ -37,6 +37,8 @@ struct AccelClass {
+     void (*pre_resume_vm)(AccelState *as, bool step_pending);
+     bool (*has_memory)(AccelState *accel, AddressSpace *as,
+                        hwaddr start_addr, hwaddr size);
++    unsigned int (*num_planes)(AccelState *accel);
++    void (*request_plane)(AccelState *accel, unsigned int id);
+ 
+     bool *allowed;
+     /*
+diff --git a/include/qemu/accel.h b/include/qemu/accel.h
+index 6f65f1cb89..b114a5ee9d 100644
+--- a/include/qemu/accel.h
++++ b/include/qemu/accel.h
+@@ -86,4 +86,22 @@ typedef struct AccelGdbConfig {
+ 
+ bool accel_supports_guest_debug(AccelState *accel);
+ 
++/**
++ * accel_num_planes:
++ * @accel: accelerator instance
++ *
++ * Return the number of interrupt and vCPU planes supported by @accel.
++ * Accelerators without plane support expose plane 0 only.
++ */
++unsigned int accel_num_planes(AccelState *accel);
++
++/**
++ * accel_request_plane:
++ * @accel: accelerator instance
++ * @id: plane selected by the machine or a device
++ *
++ * Notify @accel that plane @id is referenced by the machine configuration.
++ */
++void accel_request_plane(AccelState *accel, unsigned int id);
++
+ #endif /* QEMU_ACCEL_H */
+-- 
+2.55.0
+

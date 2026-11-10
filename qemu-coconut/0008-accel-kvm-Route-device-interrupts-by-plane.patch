@@ -1,0 +1,622 @@
+From 7bb713b72a9e7c26a3520c9b923ab61d4754fe2e Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <joerg.roedel@amd.com>
+Date: Thu, 20 Aug 2026 17:08:08 +0200
+Subject: [PATCH 08/20] accel/kvm: Route device interrupts by plane
+
+Carry the originating device's plane through emulated PCI MSI memory
+transactions and select the matching plane for KVM_SIGNAL_MSI.
+
+Pass the source device through IRQFD registration as well. This makes
+assigned-device MSI and MSI-X use the device plane while retaining the
+machine default for synthetic and legacy callers. Deassignment uses the
+same plane as assignment because the plane property becomes immutable at
+realization.
+---
+ accel/accel-irq.c           | 11 +++++----
+ accel/kvm/kvm-all.c         | 45 +++++++++++++++++++++++++++----------
+ accel/stubs/kvm-stub.c      |  5 +++--
+ hw/hyperv/hyperv.c          |  4 ++--
+ hw/i386/kvm/apic.c          | 21 ++++++++++++-----
+ hw/intc/loongarch_pch_msi.c |  2 +-
+ hw/misc/ivshmem-pci.c       |  9 +++++---
+ hw/pci/pci.c                |  2 ++
+ hw/remote/proxy.c           |  6 +++--
+ hw/s390x/virtio-ccw.c       |  5 +++--
+ hw/vfio/cpr.c               | 12 +++++-----
+ hw/vfio/pci.c               | 16 ++++++++-----
+ hw/virtio/virtio-pci.c      |  6 +++--
+ include/exec/memattrs.h     |  5 ++++-
+ include/system/accel-irq.h  |  5 +++--
+ include/system/kvm.h        |  7 +++---
+ target/i386/kvm/tdx.c       |  2 +-
+ target/i386/kvm/xen-emu.c   |  2 +-
+ 18 files changed, 110 insertions(+), 55 deletions(-)
+
+diff --git a/accel/accel-irq.c b/accel/accel-irq.c
+index 830be27c7f..5db385a881 100644
+--- a/accel/accel-irq.c
++++ b/accel/accel-irq.c
+@@ -68,24 +68,27 @@ void accel_irqchip_release_virq(int virq)
+ }
+ 
+ int accel_irqchip_add_irqfd_notifier_gsi(EventNotifier *n, EventNotifier *rn,
+-                                         int virq)
++                                         int virq, DeviceState *source)
+ {
+     if (mshv_msi_via_irqfd_enabled()) {
+         return mshv_irqchip_add_irqfd_notifier_gsi(n, rn, virq);
+     }
+     if (kvm_enabled()) {
+-        return kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, rn, virq);
++        return kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, rn, virq,
++                                                  source);
+     }
+     return -ENOSYS;
+ }
+ 
+-int accel_irqchip_remove_irqfd_notifier_gsi(EventNotifier *n, int virq)
++int accel_irqchip_remove_irqfd_notifier_gsi(EventNotifier *n, int virq,
++                                            DeviceState *source)
+ {
+     if (mshv_msi_via_irqfd_enabled()) {
+         return mshv_irqchip_remove_irqfd_notifier_gsi(n, virq);
+     }
+     if (kvm_enabled()) {
+-        return kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, n, virq);
++        return kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, n, virq,
++                                                     source);
+     }
+     return -ENOSYS;
+ }
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 74be5a5f31..04518e6221 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -2401,9 +2401,17 @@ int kvm_irqchip_get_virq(KVMState *s)
+     }
+ }
+ 
+-int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
++int kvm_irqchip_send_msi(KVMState *s, unsigned int plane_id, MSIMessage msg)
+ {
+     struct kvm_msi msi;
++    KVMPlane *plane;
++    Error *err = NULL;
++
++    plane = kvm_require_plane(s, plane_id, &err);
++    if (!plane) {
++        error_report_err(err);
++        return -EINVAL;
++    }
+ 
+     msi.address_lo = (uint32_t)msg.address;
+     msi.address_hi = msg.address >> 32;
+@@ -2411,7 +2419,7 @@ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
+     msi.flags = 0;
+     memset(msi.pad, 0, sizeof(msi.pad));
+ 
+-    return kvm_vm_ioctl(s, KVM_SIGNAL_MSI, &msi);
++    return kvm_plane_ioctl(plane, KVM_SIGNAL_MSI, &msi);
+ }
+ 
+ int kvm_irqchip_add_msi_route(AccelRouteChange *c, int vector, PCIDevice *dev)
+@@ -2502,7 +2510,7 @@ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg,
+ 
+ static int kvm_irqchip_assign_irqfd(KVMState *s, EventNotifier *event,
+                                     EventNotifier *resample, int virq,
+-                                    bool assign)
++                                    bool assign, DeviceState *source)
+ {
+     int fd = event_notifier_get_fd(event);
+     int rfd = resample ? event_notifier_get_fd(resample) : -1;
+@@ -2512,6 +2520,16 @@ static int kvm_irqchip_assign_irqfd(KVMState *s, EventNotifier *event,
+         .gsi = virq,
+         .flags = assign ? 0 : KVM_IRQFD_FLAG_DEASSIGN,
+     };
++    unsigned int plane_id = source ? qdev_get_irq_plane(source) :
++                                     qdev_default_irq_plane();
++    KVMPlane *plane;
++    Error *err = NULL;
++
++    plane = kvm_require_plane(s, plane_id, &err);
++    if (!plane) {
++        error_report_err(err);
++        return -EINVAL;
++    }
+ 
+     if (rfd != -1) {
+         assert(assign);
+@@ -2543,7 +2561,7 @@ static int kvm_irqchip_assign_irqfd(KVMState *s, EventNotifier *event,
+         }
+     }
+ 
+-    return kvm_vm_ioctl(s, KVM_IRQFD, &irqfd);
++    return kvm_plane_ioctl(plane, KVM_IRQFD, &irqfd);
+ }
+ 
+ #else /* !KVM_CAP_IRQ_ROUTING */
+@@ -2556,7 +2574,7 @@ void kvm_irqchip_release_virq(KVMState *s, int virq)
+ {
+ }
+ 
+-int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
++int kvm_irqchip_send_msi(KVMState *s, unsigned int plane_id, MSIMessage msg)
+ {
+     abort();
+ }
+@@ -2578,7 +2596,7 @@ int kvm_irqchip_add_hv_sint_route(KVMState *s, uint32_t vcpu, uint32_t sint)
+ 
+ static int kvm_irqchip_assign_irqfd(KVMState *s, EventNotifier *event,
+                                     EventNotifier *resample, int virq,
+-                                    bool assign)
++                                    bool assign, DeviceState *source)
+ {
+     abort();
+ }
+@@ -2590,15 +2608,16 @@ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg)
+ #endif /* !KVM_CAP_IRQ_ROUTING */
+ 
+ int kvm_irqchip_add_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+-                                       EventNotifier *rn, int virq)
++                                       EventNotifier *rn, int virq,
++                                       DeviceState *source)
+ {
+-    return kvm_irqchip_assign_irqfd(s, n, rn, virq, true);
++    return kvm_irqchip_assign_irqfd(s, n, rn, virq, true, source);
+ }
+ 
+ int kvm_irqchip_remove_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+-                                          int virq)
++                                          int virq, DeviceState *source)
+ {
+-    return kvm_irqchip_assign_irqfd(s, n, NULL, virq, false);
++    return kvm_irqchip_assign_irqfd(s, n, NULL, virq, false, source);
+ }
+ 
+ int kvm_irqchip_add_irqfd_notifier(KVMState *s, EventNotifier *n,
+@@ -2610,7 +2629,8 @@ int kvm_irqchip_add_irqfd_notifier(KVMState *s, EventNotifier *n,
+     if (!found) {
+         return -ENXIO;
+     }
+-    return kvm_irqchip_add_irqfd_notifier_gsi(s, n, rn, GPOINTER_TO_INT(gsi));
++    return kvm_irqchip_add_irqfd_notifier_gsi(s, n, rn,
++                                              GPOINTER_TO_INT(gsi), NULL);
+ }
+ 
+ int kvm_irqchip_remove_irqfd_notifier(KVMState *s, EventNotifier *n,
+@@ -2622,7 +2642,8 @@ int kvm_irqchip_remove_irqfd_notifier(KVMState *s, EventNotifier *n,
+     if (!found) {
+         return -ENXIO;
+     }
+-    return kvm_irqchip_remove_irqfd_notifier_gsi(s, n, GPOINTER_TO_INT(gsi));
++    return kvm_irqchip_remove_irqfd_notifier_gsi(s, n,
++                                                 GPOINTER_TO_INT(gsi), NULL);
+ }
+ 
+ void kvm_irqchip_set_qemuirq_gsi(KVMState *s, qemu_irq irq, int gsi)
+diff --git a/accel/stubs/kvm-stub.c b/accel/stubs/kvm-stub.c
+index 32b4b07403..84d0bdf667 100644
+--- a/accel/stubs/kvm-stub.c
++++ b/accel/stubs/kvm-stub.c
+@@ -98,13 +98,14 @@ void kvm_vcpufd_remove_change_notifier(NotifierWithReturn *n)
+ }
+ 
+ int kvm_irqchip_add_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+-                                       EventNotifier *rn, int virq)
++                                       EventNotifier *rn, int virq,
++                                       DeviceState *source)
+ {
+     return -ENOSYS;
+ }
+ 
+ int kvm_irqchip_remove_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+-                                          int virq)
++                                          int virq, DeviceState *source)
+ {
+     return -ENOSYS;
+ }
+diff --git a/hw/hyperv/hyperv.c b/hw/hyperv/hyperv.c
+index 900ff80213..5a1d33f467 100644
+--- a/hw/hyperv/hyperv.c
++++ b/hw/hyperv/hyperv.c
+@@ -467,7 +467,7 @@ HvSintRoute *hyperv_sint_route_new(uint32_t vp_index, uint32_t sint,
+ 
+     r = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state,
+                                            &sint_route->sint_set_notifier,
+-                                           ack_notifier, gsi);
++                                           ack_notifier, gsi, NULL);
+     if (r) {
+         goto cleanup_err_irqfd;
+     }
+@@ -525,7 +525,7 @@ void hyperv_sint_route_unref(HvSintRoute *sint_route)
+     if (sint_route->gsi) {
+         kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state,
+                                               &sint_route->sint_set_notifier,
+-                                              sint_route->gsi);
++                                              sint_route->gsi, NULL);
+         kvm_irqchip_release_virq(kvm_state, sint_route->gsi);
+         event_notifier_cleanup(&sint_route->sint_set_notifier);
+     }
+diff --git a/hw/i386/kvm/apic.c b/hw/i386/kvm/apic.c
+index 82355f0463..8d8c456c93 100644
+--- a/hw/i386/kvm/apic.c
++++ b/hw/i386/kvm/apic.c
+@@ -183,7 +183,7 @@ static void kvm_apic_external_nmi(APICCommonState *s)
+     run_on_cpu(CPU(s->cpu), do_inject_external_nmi, RUN_ON_CPU_HOST_PTR(s));
+ }
+ 
+-static void kvm_send_msi(MSIMessage *msg)
++static void kvm_send_msi_plane(MSIMessage *msg, unsigned int plane_id)
+ {
+     int ret;
+ 
+@@ -194,30 +194,39 @@ static void kvm_send_msi(MSIMessage *msg)
+      */
+     msg->address = kvm_swizzle_msi_ext_dest_id(msg->address);
+ 
+-    ret = kvm_irqchip_send_msi(kvm_state, *msg);
++    ret = kvm_irqchip_send_msi(kvm_state, plane_id, *msg);
+     if (ret < 0) {
+         fprintf(stderr, "KVM: injection failed, MSI lost (%s)\n",
+                 strerror(-ret));
+     }
+ }
+ 
++static void kvm_send_msi(MSIMessage *msg)
++{
++    kvm_send_msi_plane(msg, qdev_default_irq_plane());
++}
++
+ static uint64_t kvm_apic_mem_read(void *opaque, hwaddr addr,
+                                   unsigned size)
+ {
+     return ~(uint64_t)0;
+ }
+ 
+-static void kvm_apic_mem_write(void *opaque, hwaddr addr,
+-                               uint64_t data, unsigned size)
++static MemTxResult kvm_apic_mem_write(void *opaque, hwaddr addr,
++                                      uint64_t data, unsigned size,
++                                      MemTxAttrs attrs)
+ {
+     MSIMessage msg = { .address = addr, .data = data };
++    unsigned int plane_id = attrs.irq_plane_valid ?
++                            attrs.irq_plane : qdev_default_irq_plane();
+ 
+-    kvm_send_msi(&msg);
++    kvm_send_msi_plane(&msg, plane_id);
++    return MEMTX_OK;
+ }
+ 
+ static const MemoryRegionOps kvm_apic_io_ops = {
+     .read = kvm_apic_mem_read,
+-    .write = kvm_apic_mem_write,
++    .write_with_attrs = kvm_apic_mem_write,
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+ 
+diff --git a/hw/intc/loongarch_pch_msi.c b/hw/intc/loongarch_pch_msi.c
+index 3656c6cea9..17523f4b55 100644
+--- a/hw/intc/loongarch_pch_msi.c
++++ b/hw/intc/loongarch_pch_msi.c
+@@ -32,7 +32,7 @@ static void loongarch_msi_mem_write(void *opaque, hwaddr addr,
+ 
+         msg.address = addr;
+         msg.data = val;
+-        kvm_irqchip_send_msi(kvm_state, msg);
++        kvm_irqchip_send_msi(kvm_state, qdev_get_irq_plane(DEVICE(s)), msg);
+         return;
+     }
+ 
+diff --git a/hw/misc/ivshmem-pci.c b/hw/misc/ivshmem-pci.c
+index 372e9dc58d..38850d2a5f 100644
+--- a/hw/misc/ivshmem-pci.c
++++ b/hw/misc/ivshmem-pci.c
+@@ -293,7 +293,8 @@ static int ivshmem_vector_unmask(PCIDevice *dev, unsigned vector,
+     }
+     kvm_irqchip_commit_routes(kvm_state);
+ 
+-    ret = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, v->virq);
++    ret = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, v->virq,
++                                             DEVICE(dev));
+     if (ret < 0) {
+         return ret;
+     }
+@@ -316,7 +317,8 @@ static void ivshmem_vector_mask(PCIDevice *dev, unsigned vector)
+     }
+     assert(v->unmasked);
+ 
+-    ret = kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, n, v->virq);
++    ret = kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, n, v->virq,
++                                                DEVICE(dev));
+     if (ret < 0) {
+         error_report("remove_irqfd_notifier_gsi failed");
+         return;
+@@ -466,7 +468,8 @@ static bool setup_interrupt(IVShmemState *s, int vector, Error **errp)
+ 
+         if (!msix_is_masked(pdev, vector)) {
+             ret = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL,
+-                                               s->msi_vectors[vector].virq);
++                                               s->msi_vectors[vector].virq,
++                                               DEVICE(s));
+             if (ret < 0) {
+                 error_setg(errp, "Failed to configure irqfd notifier");
+                 return false;
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index d3191609e2..25ba7c3471 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -453,6 +453,8 @@ static void pci_msi_trigger(PCIDevice *dev, MSIMessage msg)
+         return;
+     }
+     attrs.requester_id = pci_requester_id(dev);
++    attrs.irq_plane = qdev_get_irq_plane(DEVICE(dev));
++    attrs.irq_plane_valid = true;
+     address_space_stl_le(&dev->bus_master_as, msg.address, msg.data,
+                          attrs, NULL);
+ }
+diff --git a/hw/remote/proxy.c b/hw/remote/proxy.c
+index e91566509f..313d0e342e 100644
+--- a/hw/remote/proxy.c
++++ b/hw/remote/proxy.c
+@@ -33,7 +33,8 @@ static void proxy_intx_update(PCIDevice *pci_dev)
+     int pin = pci_get_byte(pci_dev->config + PCI_INTERRUPT_PIN) - 1;
+ 
+     if (dev->virq != -1) {
+-        kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, &dev->intr, dev->virq);
++        kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, &dev->intr,
++                                              dev->virq, DEVICE(dev));
+         dev->virq = -1;
+     }
+ 
+@@ -43,7 +44,8 @@ static void proxy_intx_update(PCIDevice *pci_dev)
+ 
+     if (dev->virq != -1) {
+         kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &dev->intr,
+-                                           &dev->resample, dev->virq);
++                                           &dev->resample, dev->virq,
++                                           DEVICE(dev));
+     }
+ }
+ 
+diff --git a/hw/s390x/virtio-ccw.c b/hw/s390x/virtio-ccw.c
+index d82874ed27..66b9ad9ef1 100644
+--- a/hw/s390x/virtio-ccw.c
++++ b/hw/s390x/virtio-ccw.c
+@@ -1004,7 +1004,7 @@ static int virtio_ccw_add_irqfd(VirtioCcwDevice *dev, int n)
+     EventNotifier *notifier = virtio_queue_get_guest_notifier(vq);
+ 
+     return kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, notifier, NULL,
+-                                              dev->routes.gsi[n]);
++                                              dev->routes.gsi[n], DEVICE(dev));
+ }
+ 
+ static void virtio_ccw_remove_irqfd(VirtioCcwDevice *dev, int n)
+@@ -1015,7 +1015,8 @@ static void virtio_ccw_remove_irqfd(VirtioCcwDevice *dev, int n)
+     int ret;
+ 
+     ret = kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, notifier,
+-                                                dev->routes.gsi[n]);
++                                                dev->routes.gsi[n],
++                                                DEVICE(dev));
+     assert(ret == 0);
+ }
+ 
+diff --git a/hw/vfio/cpr.c b/hw/vfio/cpr.c
+index ffa4f8e099..4261100ff1 100644
+--- a/hw/vfio/cpr.c
++++ b/hw/vfio/cpr.c
+@@ -202,12 +202,13 @@ void vfio_cpr_add_kvm_notifier(void)
+ }
+ 
+ static int set_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+-                                  EventNotifier *rn, int virq, bool enable)
++                                  EventNotifier *rn, int virq, bool enable,
++                                  DeviceState *source)
+ {
+     if (enable) {
+-        return kvm_irqchip_add_irqfd_notifier_gsi(s, n, rn, virq);
++        return kvm_irqchip_add_irqfd_notifier_gsi(s, n, rn, virq, source);
+     } else {
+-        return kvm_irqchip_remove_irqfd_notifier_gsi(s, n, virq);
++        return kvm_irqchip_remove_irqfd_notifier_gsi(s, n, virq, source);
+     }
+ }
+ 
+@@ -226,7 +227,7 @@ static int vfio_cpr_set_msi_virq(VFIOPCIDevice *vdev, Error **errp, bool enable)
+     } else if (vfio_pci_read_config(pdev, PCI_INTERRUPT_PIN, 1)) {
+         ret = set_irqfd_notifier_gsi(kvm_state, &vdev->intx.interrupt,
+                                      &vdev->intx.unmask, vdev->intx.route.irq,
+-                                     enable);
++                                     enable, DEVICE(vdev));
+         if (ret) {
+             error_setg_errno(errp, -ret, "failed to %s INTx irq %d",
+                              op, vdev->intx.route.irq);
+@@ -243,7 +244,8 @@ static int vfio_cpr_set_msi_virq(VFIOPCIDevice *vdev, Error **errp, bool enable)
+         VFIOMSIVector *vector = &vdev->msi_vectors[i];
+         if (vector->use) {
+             ret = set_irqfd_notifier_gsi(kvm_state, &vector->kvm_interrupt,
+-                                         NULL, vector->virq, enable);
++                                         NULL, vector->virq, enable,
++                                         DEVICE(vdev));
+             if (ret) {
+                 error_setg_errno(errp, -ret,
+                                  "failed to %s msi vector %d virq %d",
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 428ab2f069..a3bba4fef0 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -176,7 +176,8 @@ static bool vfio_intx_enable_kvm(VFIOPCIDevice *vdev, Error **errp)
+     if (kvm_irqchip_add_irqfd_notifier_gsi(kvm_state,
+                                            &vdev->intx.interrupt,
+                                            &vdev->intx.unmask,
+-                                           vdev->intx.route.irq)) {
++                                           vdev->intx.route.irq,
++                                           DEVICE(vdev))) {
+         error_setg_errno(errp, errno, "failed to setup resample irqfd");
+         goto fail_irqfd;
+     }
+@@ -199,7 +200,7 @@ static bool vfio_intx_enable_kvm(VFIOPCIDevice *vdev, Error **errp)
+ 
+ fail_vfio:
+     kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, &vdev->intx.interrupt,
+-                                          vdev->intx.route.irq);
++                                          vdev->intx.route.irq, DEVICE(vdev));
+ fail_irqfd:
+     vfio_notifier_cleanup(vdev, &vdev->intx.unmask, "intx-unmask", 0);
+ fail:
+@@ -223,7 +224,8 @@ static bool vfio_cpr_intx_enable_kvm(VFIOPCIDevice *vdev, Error **errp)
+     if (kvm_irqchip_add_irqfd_notifier_gsi(kvm_state,
+                                            &vdev->intx.interrupt,
+                                            &vdev->intx.unmask,
+-                                           vdev->intx.route.irq)) {
++                                           vdev->intx.route.irq,
++                                           DEVICE(vdev))) {
+         error_setg_errno(errp, errno, "failed to setup resample irqfd");
+         vfio_notifier_cleanup(vdev, &vdev->intx.unmask, "intx-unmask", 0);
+         return false;
+@@ -252,7 +254,8 @@ static void vfio_intx_disable_kvm(VFIOPCIDevice *vdev)
+ 
+     /* Tell KVM to stop listening for an INTx irqfd */
+     if (kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, &vdev->intx.interrupt,
+-                                              vdev->intx.route.irq)) {
++                                              vdev->intx.route.irq,
++                                              DEVICE(vdev))) {
+         error_report("vfio: Error: Failed to disable INTx irqfd: %m");
+     }
+ 
+@@ -599,7 +602,8 @@ static void vfio_connect_kvm_msi_virq(VFIOMSIVector *vector, int nr)
+     }
+ 
+     if (kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, &vector->kvm_interrupt,
+-                                           NULL, vector->virq) < 0) {
++                                           NULL, vector->virq,
++                                           DEVICE(vector->vdev)) < 0) {
+         goto fail_kvm;
+     }
+ 
+@@ -616,7 +620,7 @@ static void vfio_remove_kvm_msi_virq(VFIOPCIDevice *vdev, VFIOMSIVector *vector,
+                                      int nr)
+ {
+     kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, &vector->kvm_interrupt,
+-                                          vector->virq);
++                                          vector->virq, DEVICE(vdev));
+     kvm_irqchip_release_virq(kvm_state, vector->virq);
+     vector->virq = -1;
+     vfio_notifier_cleanup(vdev, &vector->kvm_interrupt, "kvm_interrupt", nr);
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index 6f5db5fc42..05871fc68b 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -895,7 +895,8 @@ static int kvm_virtio_pci_irqfd_use(VirtIOPCIProxy *proxy,
+                                  unsigned int vector)
+ {
+     VirtIOIRQFD *irqfd = &proxy->vector_irqfd[vector];
+-    return accel_irqchip_add_irqfd_notifier_gsi(n, NULL, irqfd->virq);
++    return accel_irqchip_add_irqfd_notifier_gsi(n, NULL, irqfd->virq,
++                                                DEVICE(proxy));
+ }
+ 
+ static void kvm_virtio_pci_irqfd_release(VirtIOPCIProxy *proxy,
+@@ -905,7 +906,8 @@ static void kvm_virtio_pci_irqfd_release(VirtIOPCIProxy *proxy,
+     VirtIOIRQFD *irqfd = &proxy->vector_irqfd[vector];
+     int ret;
+ 
+-    ret = accel_irqchip_remove_irqfd_notifier_gsi(n, irqfd->virq);
++    ret = accel_irqchip_remove_irqfd_notifier_gsi(n, irqfd->virq,
++                                                  DEVICE(proxy));
+     assert(ret == 0);
+ }
+ static int virtio_pci_get_notifier(VirtIOPCIProxy *proxy, int queue_no,
+diff --git a/include/exec/memattrs.h b/include/exec/memattrs.h
+index 52ee955249..3a2c4b77ac 100644
+--- a/include/exec/memattrs.h
++++ b/include/exec/memattrs.h
+@@ -57,6 +57,9 @@ typedef struct MemTxAttrs {
+     /* PCI - IOMMU operations, see PCIAddressType */
+     unsigned int address_type:1;
+ 
++    /* Interrupt plane selected by the originating device. */
++    unsigned int irq_plane_valid:1;
++
+     /*
+      * Bus masters which don't specify any attributes will get this
+      * (via the MEMTXATTRS_UNSPECIFIED constant), so that we can
+@@ -66,7 +69,7 @@ typedef struct MemTxAttrs {
+      */
+     bool unspecified;
+ 
+-    uint8_t _reserved1;
++    uint8_t irq_plane;
+     uint16_t _reserved2;
+ } MemTxAttrs;
+ 
+diff --git a/include/system/accel-irq.h b/include/system/accel-irq.h
+index fc94c54264..2f9c7d8b44 100644
+--- a/include/system/accel-irq.h
++++ b/include/system/accel-irq.h
+@@ -33,6 +33,7 @@ void accel_irqchip_commit_route_changes(AccelRouteChange *c);
+ void accel_irqchip_commit_routes(void);
+ void accel_irqchip_release_virq(int virq);
+ int accel_irqchip_add_irqfd_notifier_gsi(EventNotifier *n, EventNotifier *rn,
+-                                         int virq);
+-int accel_irqchip_remove_irqfd_notifier_gsi(EventNotifier *n, int virq);
++                                         int virq, DeviceState *source);
++int accel_irqchip_remove_irqfd_notifier_gsi(EventNotifier *n, int virq,
++                                            DeviceState *source);
+ #endif
+diff --git a/include/system/kvm.h b/include/system/kvm.h
+index d480d9e03c..4a0d9ee3b1 100644
+--- a/include/system/kvm.h
++++ b/include/system/kvm.h
+@@ -396,7 +396,7 @@ int kvm_arch_release_virq_post(int virq);
+ int kvm_arch_msi_data_to_gsi(uint32_t data);
+ 
+ int kvm_set_irq(KVMState *s, int irq, int level);
+-int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg);
++int kvm_irqchip_send_msi(KVMState *s, unsigned int plane_id, MSIMessage msg);
+ 
+ void kvm_irqchip_add_irq_route(KVMState *s, int gsi, int irqchip, int pin);
+ 
+@@ -492,9 +492,10 @@ void kvm_add_routing_entry(KVMState *s,
+                            struct kvm_irq_routing_entry *entry);
+ 
+ int kvm_irqchip_add_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+-                                       EventNotifier *rn, int virq);
++                                       EventNotifier *rn, int virq,
++                                       DeviceState *source);
+ int kvm_irqchip_remove_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
+-                                          int virq);
++                                          int virq, DeviceState *source);
+ int kvm_irqchip_add_irqfd_notifier(KVMState *s, EventNotifier *n,
+                                    EventNotifier *rn, qemu_irq irq);
+ int kvm_irqchip_remove_irqfd_notifier(KVMState *s, EventNotifier *n,
+diff --git a/target/i386/kvm/tdx.c b/target/i386/kvm/tdx.c
+index 8294dbde3a..6947474815 100644
+--- a/target/i386/kvm/tdx.c
++++ b/target/i386/kvm/tdx.c
+@@ -1208,7 +1208,7 @@ static void tdx_inject_interrupt(TdxGuest *tdx)
+         .data = vector | (APIC_DM_FIXED << MSI_DATA_DELIVERY_MODE_SHIFT),
+     };
+ 
+-    ret = kvm_irqchip_send_msi(kvm_state, msg);
++    ret = kvm_irqchip_send_msi(kvm_state, qdev_default_irq_plane(), msg);
+     if (ret < 0) {
+         /* In this case, no better way to tell it to guest. Log it. */
+         error_report("TDX: injection interrupt %d failed, interrupt lost (%s).",
+diff --git a/target/i386/kvm/xen-emu.c b/target/i386/kvm/xen-emu.c
+index 29364a9279..d2f3bedb6e 100644
+--- a/target/i386/kvm/xen-emu.c
++++ b/target/i386/kvm/xen-emu.c
+@@ -487,7 +487,7 @@ void kvm_xen_inject_vcpu_callback_vector(uint32_t vcpu_id, int type)
+                        (X86_CPU(cs)->apic_id << MSI_ADDR_DEST_ID_SHIFT),
+             .data = vector | (1UL << MSI_DATA_LEVEL_SHIFT),
+         };
+-        kvm_irqchip_send_msi(kvm_state, msg);
++        kvm_irqchip_send_msi(kvm_state, qdev_default_irq_plane(), msg);
+         return;
+     }
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,100 @@
+From 6268c2afd39649cb1e3be14a86b1dc9a1f1817c3 Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <joerg.roedel@amd.com>
+Date: Thu, 20 Aug 2026 17:08:59 +0200
+Subject: [PATCH 09/20] docs: Document KVM plane configuration
+
+Describe the machine default and per-device override, including
+examples for emulated and assigned PCI devices. Document the shared
+legacy routing table, QOM plane objects, host requirements, and
+migration limitation.
+---
+ MAINTAINERS                     |  1 +
+ docs/system/i386/kvm-planes.rst | 51 +++++++++++++++++++++++++++++++++
+ docs/system/target-i386.rst     |  1 +
+ 3 files changed, 53 insertions(+)
+ create mode 100644 docs/system/i386/kvm-planes.rst
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 902db77218..4464718934 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -477,6 +477,7 @@ S: Supported
+ F: */*/kvm*
+ F: accel/kvm/
+ F: accel/stubs/kvm-stub.c
++F: docs/system/i386/kvm-planes.rst
+ F: include/system/kvm*.h
+ F: scripts/kvm/kvm_flightrecorder
+ 
+diff --git a/docs/system/i386/kvm-planes.rst b/docs/system/i386/kvm-planes.rst
+new file mode 100644
+index 0000000000..8a1927145d
+--- /dev/null
++++ b/docs/system/i386/kvm-planes.rst
+@@ -0,0 +1,51 @@
++KVM planes
++==========
++
++KVM planes provide separate privilege levels within one virtual machine.  A
++plane has its own virtual CPU state and can be selected as the destination of
++device interrupts.  Plane 0 is always present; additional planes require a
++host kernel that advertises ``KVM_CAP_PLANES``.
++
++Configuring interrupt delivery
++------------------------------
++
++The machine ``device-plane`` property selects the default destination for
++device interrupts.  Every QDEV inherits that value unless its ``plane``
++property is explicitly set.  For example::
++
++  qemu-system-x86_64 -accel kvm -machine q35,device-plane=1 \
++      -device virtio-net-pci,netdev=net0,plane=2 \
++      -netdev user,id=net0 \
++      -device vfio-pci,host=0000:01:00.0,plane=2
++
++In this example, devices without an override deliver interrupts to plane 1.
++The network and assigned PCI devices deliver MSI and MSI-X interrupts to
++plane 2.  A plane number must be smaller than the number reported by
++``KVM_CAP_PLANES``.  Plane properties cannot be changed after the machine or
++device has been realized.
++
++QEMU creates nonzero planes on demand.  They require an in-kernel interrupt
++controller.  Emulated PCI MSI writes and KVM IRQFD delivery both retain the
++originating device's plane selection, so the property applies to emulated and
++assigned devices.
++
++Legacy interrupt limitation
++---------------------------
++
++KVM has one GSI routing table shared by all planes.  QEMU installs that table
++through the machine's default device plane, so IRQCHIP-routed interrupts such
++as PIC, IOAPIC, PIT, RTC, and PCI INTx all target the default plane.  A
++per-device override affects MSI and MSI-X delivery, but cannot independently
++redirect those legacy interrupts.
++
++Object model and migration
++--------------------------
++
++The KVM accelerator exposes a ``kvm-plane`` child named ``plane[N]`` for each
++supported plane.  Each plane contains ``kvm-plane-vcpu`` children named
++``vcpu[N]`` as KVM requests virtual CPUs for that plane.  Their read-only
++``id`` and ``vcpu-id`` properties represent the kernel identifiers and provide
++the object-model foundation for future per-plane migration state.
++
++Migration is currently blocked as soon as QEMU creates a nonzero plane.
++Plane 0 retains the existing KVM migration behavior.
+diff --git a/docs/system/target-i386.rst b/docs/system/target-i386.rst
+index 2374391397..d3195e0241 100644
+--- a/docs/system/target-i386.rst
++++ b/docs/system/target-i386.rst
+@@ -29,6 +29,7 @@ Architectural features
+    i386/xen
+    i386/xenpvh
+    i386/kvm-pv
++   i386/kvm-planes
+    i386/sgx
+    i386/amd-memory-encryption
+    i386/tdx
+-- 
+2.55.0
+

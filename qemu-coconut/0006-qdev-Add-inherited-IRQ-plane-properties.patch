@@ -1,0 +1,370 @@
+From f81abbae724f934b9e56927880cec9d5c0cb266b Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <joerg.roedel@amd.com>
+Date: Thu, 20 Aug 2026 17:01:58 +0200
+Subject: [PATCH 06/20] qdev: Add inherited IRQ plane properties
+
+Add numeric machine.device-plane and device.plane properties. Devices
+inherit the machine value unless explicitly overridden, and both values
+are checked against the accelerator plane count.
+
+Notify the accelerator about the machine default before board creation
+and about explicit device selections during realization, so it can
+materialize the referenced plane objects.
+---
+ hw/core/machine.c                   | 58 +++++++++++++++++++++++++++++
+ hw/core/qdev-user.c                 | 14 +++++++
+ hw/core/qdev.c                      | 44 ++++++++++++++++++++++
+ include/hw/core/boards.h            |  1 +
+ include/hw/core/qdev.h              | 12 ++++++
+ qemu-options.hx                     |  7 +++-
+ tests/unit/test-qdev-global-props.c | 13 +++++++
+ tests/unit/test-qdev.c              | 51 +++++++++++++++++++++++++
+ 8 files changed, 199 insertions(+), 1 deletion(-)
+
+diff --git a/hw/core/machine.c b/hw/core/machine.c
+index 73b4d82b4a..c7cde0c6df 100644
+--- a/hw/core/machine.c
++++ b/hw/core/machine.c
+@@ -1054,6 +1054,52 @@ out:
+     return r;
+ }
+ 
++static void machine_get_device_plane(Object *obj, Visitor *v,
++                                     const char *name, void *opaque,
++                                     Error **errp)
++{
++    uint8_t value = MACHINE(obj)->device_plane;
++
++    visit_type_uint8(v, name, &value, errp);
++}
++
++static void machine_set_device_plane(Object *obj, Visitor *v,
++                                     const char *name, void *opaque,
++                                     Error **errp)
++{
++    uint8_t value;
++
++    if (phase_check(PHASE_MACHINE_INITIALIZED)) {
++        error_setg(errp,
++                   "device-plane cannot be changed after machine initialization");
++        return;
++    }
++    if (visit_type_uint8(v, name, &value, errp)) {
++        MACHINE(obj)->device_plane = value;
++    }
++}
++
++uint8_t qdev_default_irq_plane(void)
++{
++    return current_machine ? current_machine->device_plane : 0;
++}
++
++unsigned int qdev_num_irq_planes(void)
++{
++    if (!current_machine || !current_machine->accelerator) {
++        return 1;
++    }
++    return accel_num_planes(current_machine->accelerator);
++}
++
++void qdev_request_irq_plane(DeviceState *dev)
++{
++    if (current_machine && current_machine->accelerator) {
++        accel_request_plane(current_machine->accelerator,
++                            qdev_get_irq_plane(dev));
++    }
++}
++
+ static void machine_class_init(ObjectClass *oc, const void *data)
+ {
+     MachineClass *mc = MACHINE_CLASS(oc);
+@@ -1236,6 +1282,11 @@ static void machine_initfn(Object *obj)
+     ms->kernel_cmdline = g_strdup("");
+     ms->ram_size = mc->default_ram_size;
+     ms->maxram_size = mc->default_ram_size;
++    object_property_add(obj, "device-plane", "uint8",
++                        machine_get_device_plane, machine_set_device_plane,
++                        NULL, NULL);
++    object_property_set_description(obj, "device-plane",
++                                    "Default plane to receive device IRQs");
+ 
+     if (mc->nvdimm_supported) {
+         ms->nvdimms_state = g_new0(NVDIMMState, 1);
+@@ -1694,6 +1745,13 @@ void machine_run_board_init(MachineState *machine, const char *mem_path, Error *
+                                    "on", false);
+     }
+ 
++    if (machine->device_plane >= accel_num_planes(machine->accelerator)) {
++        error_setg(errp, "machine requests unsupported IRQ plane %u",
++                   machine->device_plane);
++        return;
++    }
++    accel_request_plane(machine->accelerator, machine->device_plane);
++
+     accel_init_interfaces(ACCEL_GET_CLASS(machine->accelerator));
+     machine_class->init(machine);
+     phase_advance(PHASE_MACHINE_INITIALIZED);
+diff --git a/hw/core/qdev-user.c b/hw/core/qdev-user.c
+index 051f8fbd02..2d122ebbab 100644
+--- a/hw/core/qdev-user.c
++++ b/hw/core/qdev-user.c
+@@ -9,6 +9,20 @@
+ #include "qom/object.h"
+ #include "hw/core/qdev.h"
+ 
++uint8_t qdev_default_irq_plane(void)
++{
++    return 0;
++}
++
++unsigned int qdev_num_irq_planes(void)
++{
++    return 1;
++}
++
++void qdev_request_irq_plane(DeviceState *dev)
++{
++}
++
+ void qdev_create_fake_machine(void)
+ {
+     Object *fake_machine_obj;
+diff --git a/hw/core/qdev.c b/hw/core/qdev.c
+index e2aab3d1fc..6c582e2165 100644
+--- a/hw/core/qdev.c
++++ b/hw/core/qdev.c
+@@ -489,6 +489,14 @@ static void device_set_realized(Object *obj, bool value, Error **errp)
+     }
+ 
+     if (value && !dev->realized) {
++        if (qdev_get_irq_plane(dev) >= qdev_num_irq_planes()) {
++            error_setg(errp, "device requests unsupported IRQ plane %u",
++                       qdev_get_irq_plane(dev));
++            goto fail;
++        }
++        if (dev->irq_plane_set) {
++            qdev_request_irq_plane(dev);
++        }
+         if (!check_only_migratable(obj, errp)) {
+             goto fail;
+         }
+@@ -653,6 +661,39 @@ static bool device_get_hotplugged(Object *obj, Error **errp)
+     return dev->hotplugged;
+ }
+ 
++uint8_t qdev_get_irq_plane(DeviceState *dev)
++{
++    if (dev && dev->irq_plane_set) {
++        return dev->irq_plane;
++    }
++    return qdev_default_irq_plane();
++}
++
++static void device_get_irq_plane(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    uint8_t value = qdev_get_irq_plane(DEVICE(obj));
++
++    visit_type_uint8(v, name, &value, errp);
++}
++
++static void device_set_irq_plane(Object *obj, Visitor *v, const char *name,
++                                 void *opaque, Error **errp)
++{
++    DeviceState *dev = DEVICE(obj);
++    uint8_t value;
++
++    if (dev->realized) {
++        error_setg(errp, "plane cannot be changed after device realization");
++        return;
++    }
++    if (!visit_type_uint8(v, name, &value, errp)) {
++        return;
++    }
++    dev->irq_plane = value;
++    dev->irq_plane_set = true;
++}
++
+ static void device_initfn(Object *obj)
+ {
+     DeviceState *dev = DEVICE(obj);
+@@ -787,6 +828,9 @@ static void device_class_init(ObjectClass *class, const void *data)
+                                    device_get_hotplugged, NULL);
+     object_class_property_add_link(class, "parent_bus", TYPE_BUS,
+                                    offsetof(DeviceState, parent_bus), NULL, 0);
++    object_class_property_add(class, "plane", "uint8",
++                              device_get_irq_plane, device_set_irq_plane,
++                              NULL, NULL);
+ }
+ 
+ static void do_legacy_reset(Object *obj, ResetType type)
+diff --git a/include/hw/core/boards.h b/include/hw/core/boards.h
+index 29c68931d8..f6e0bb170b 100644
+--- a/include/hw/core/boards.h
++++ b/include/hw/core/boards.h
+@@ -454,6 +454,7 @@ struct MachineState {
+      * Set to false by default for all regular use.
+      */
+     bool new_accel_vmfd_on_reset;
++    uint8_t device_plane;
+ };
+ 
+ /*
+diff --git a/include/hw/core/qdev.h b/include/hw/core/qdev.h
+index e147622341..3427bb445a 100644
+--- a/include/hw/core/qdev.h
++++ b/include/hw/core/qdev.h
+@@ -295,6 +295,14 @@ struct DeviceState {
+      * Used to prevent re-entrancy confusing things.
+      */
+     MemReentrancyGuard mem_reentrancy_guard;
++    /**
++     * @irq_plane: IRQ plane explicitly selected for this device
++     */
++    uint8_t irq_plane;
++    /**
++     * @irq_plane_set: whether @irq_plane overrides the machine default
++     */
++    bool irq_plane_set;
+ };
+ 
+ typedef struct DeviceListener DeviceListener;
+@@ -533,6 +541,10 @@ void qdev_simple_device_unplug_cb(HotplugHandler *hotplug_dev,
+                                   DeviceState *dev, Error **errp);
+ void qdev_machine_creation_done(void);
+ bool qdev_machine_modified(void);
++uint8_t qdev_get_irq_plane(DeviceState *dev);
++uint8_t qdev_default_irq_plane(void);
++unsigned int qdev_num_irq_planes(void);
++void qdev_request_irq_plane(DeviceState *dev);
+ 
+ /**
+  * qdev_add_unplug_blocker: Add an unplug blocker to a device
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 34970fffc9..786c8ee607 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -46,7 +46,8 @@ DEF("machine", HAS_ARG, QEMU_OPTION_machine, \
+     "                memory-backend='backend-id' specifies explicitly provided backend for main RAM (default=none)\n"
+     "                cxl-fmw.0.targets.0=firsttarget,cxl-fmw.0.targets.1=secondtarget,cxl-fmw.0.size=size[,cxl-fmw.0.interleave-granularity=granularity]\n"
+     "                sgx-epc.0.memdev=memid,sgx-epc.0.node=numaid\n"
+-    "                smp-cache.0.cache=cachename,smp-cache.0.topology=topologylevel\n",
++    "                smp-cache.0.cache=cachename,smp-cache.0.topology=topologylevel\n"
++    "                device-plane=<plane-id>\n",
+     QEMU_ARCH_ALL)
+ SRST
+ ``-machine [type=]name[,prop=value[,...]]``
+@@ -214,6 +215,10 @@ SRST
+         ::
+ 
+             -machine smp-cache.0.cache=l1d,smp-cache.0.topology=core,smp-cache.1.cache=l1i,smp-cache.1.topology=core
++
++    ``device-plane=<plane-id>``
++        Set the default plane device IRQ are sent to.
++
+ ERST
+ 
+ DEF("M", HAS_ARG, QEMU_OPTION_M,
+diff --git a/tests/unit/test-qdev-global-props.c b/tests/unit/test-qdev-global-props.c
+index 8ea362cbb9..50654dcbec 100644
+--- a/tests/unit/test-qdev-global-props.c
++++ b/tests/unit/test-qdev-global-props.c
+@@ -29,6 +29,19 @@
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ 
++uint8_t qdev_default_irq_plane(void)
++{
++    return 0;
++}
++
++unsigned int qdev_num_irq_planes(void)
++{
++    return 1;
++}
++
++void qdev_request_irq_plane(DeviceState *dev)
++{
++}
+ 
+ #define TYPE_STATIC_PROPS "static_prop_type"
+ typedef struct MyType MyType;
+diff --git a/tests/unit/test-qdev.c b/tests/unit/test-qdev.c
+index 20eae38e03..491db48a50 100644
+--- a/tests/unit/test-qdev.c
++++ b/tests/unit/test-qdev.c
+@@ -4,6 +4,24 @@
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ 
++static uint8_t test_default_irq_plane;
++static unsigned int test_num_irq_planes = 1;
++static int test_requested_irq_plane = -1;
++
++uint8_t qdev_default_irq_plane(void)
++{
++    return test_default_irq_plane;
++}
++
++unsigned int qdev_num_irq_planes(void)
++{
++    return test_num_irq_planes;
++}
++
++void qdev_request_irq_plane(DeviceState *dev)
++{
++    test_requested_irq_plane = qdev_get_irq_plane(dev);
++}
+ 
+ #define TYPE_MY_DEV "my-dev"
+ typedef struct MyDev MyDev;
+@@ -78,6 +96,38 @@ static void test_qdev_free_properties(void)
+     object_unref(mt);
+ }
+ 
++static void test_qdev_irq_plane(void)
++{
++    DeviceState *dev = DEVICE(object_new(TYPE_MY_DEV));
++    DeviceState *bad = DEVICE(object_new(TYPE_MY_DEV));
++    Error *err = NULL;
++
++    test_default_irq_plane = 3;
++    test_num_irq_planes = 4;
++    g_assert_cmpuint(qdev_get_irq_plane(dev), ==, 3);
++
++    object_property_set_uint(OBJECT(dev), "plane", 2, &error_abort);
++    g_assert_cmpuint(qdev_get_irq_plane(dev), ==, 2);
++    qdev_realize(dev, NULL, &error_abort);
++    g_assert_cmpint(test_requested_irq_plane, ==, 2);
++    object_property_set_uint(OBJECT(dev), "plane", 1, &err);
++    g_assert_nonnull(err);
++    error_free(err);
++    err = NULL;
++
++    object_property_set_uint(OBJECT(bad), "plane", 4, &error_abort);
++    qdev_realize(bad, NULL, &err);
++    g_assert_nonnull(err);
++    error_free(err);
++
++    object_unparent(OBJECT(dev));
++    object_unref(dev);
++    object_unref(bad);
++    test_default_irq_plane = 0;
++    test_num_irq_planes = 1;
++    test_requested_irq_plane = -1;
++}
++
+ 
+ int main(int argc, char **argv)
+ {
+@@ -89,6 +139,7 @@ int main(int argc, char **argv)
+ 
+     g_test_add_func("/qdev/free-properties",
+                     test_qdev_free_properties);
++    g_test_add_func("/qdev/irq-plane", test_qdev_irq_plane);
+ 
+     g_test_run();
+ 
+-- 
+2.55.0
+

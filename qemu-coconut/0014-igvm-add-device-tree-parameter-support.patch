@@ -1,0 +1,43 @@
+From 5d676d243f8e23ab4165f5119581a49a0d8ed14f Mon Sep 17 00:00:00 2001
+From: Luigi Leonardi <leonardi@redhat.com>
+Date: Mon, 15 Jun 2026 11:11:53 +0200
+Subject: [PATCH 14/20] igvm: add device tree parameter support
+
+Coconut SVSM, with the upcoming device tree support [1], will use
+the IGVM device tree parameter to discover virtio-mmio and ISA serial
+devices instead of relying on the fw_cfg interface, which is
+QEMU-specific.
+
+The device tree is packed before copying into the IGVM parameter area
+to reduce its size, since IGVM files can define tighter memory
+constraints for parameter areas. Packing is done in the generic IGVM
+backend rather than in per-architecture device tree setup code, so
+that each architecture does not need to handle it individually.
+
+[1] https://github.com/coconut-svsm/svsm/pull/1006
+
+Signed-off-by: Luigi Leonardi <leonardi@redhat.com>
+---
+ backends/igvm.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/backends/igvm.c b/backends/igvm.c
+index 80e87fe602..8a334c1c42 100644
+--- a/backends/igvm.c
++++ b/backends/igvm.c
+@@ -807,9 +807,10 @@ static int qigvm_directive_device_tree(QIgvm *ctx, const uint8_t *header_data,
+     QIgvmParameterData *param_entry;
+     uint32_t fdt_size;
+ 
+-    param_entry = qigvm_find_param_entry(ctx,
+-                                         param->parameter_area_index, errp);
++    param_entry = qigvm_find_param_entry(ctx, param->parameter_area_index, errp);
+     if (param_entry == NULL) {
++        error_setg(errp, "IGVM: parameter area index %u not found",
++                   param->parameter_area_index);
+         return -1;
+     }
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,212 @@
+From 3cb528b35ea78f3898004dfd772bf57c1ef540eb Mon Sep 17 00:00:00 2001
+From: Luigi Leonardi <leonardi@redhat.com>
+Date: Mon, 16 Mar 2026 17:08:24 +0100
+Subject: [PATCH 10/20] hw/i386: add device tree generation for PC machine
+
+Generate a flattened device tree describing virtio-mmio devices on
+the PC machine. This FDT is consumed by Coconut SVSM firmware,
+which uses it to discover devices assigned to the firmware plane
+via IGVM parameters instead of relying on fw_cfg.
+
+The device tree is intentionally incomplete: CPUs and memory are
+not included as firmware obtains that information through other
+channels.
+
+Add FDT/DEVICE_TREE dependency to the PC Kconfig.
+The implementation is based on hw/i386/microvm-dt.c.
+
+Signed-off-by: Luigi Leonardi <leonardi@redhat.com>
+---
+ hw/i386/Kconfig         |   2 +
+ hw/i386/meson.build     |   1 +
+ hw/i386/pc.c            |   5 ++
+ hw/i386/x86_dt_common.c | 104 ++++++++++++++++++++++++++++++++++++++++
+ hw/i386/x86_dt_common.h |  10 ++++
+ 5 files changed, 122 insertions(+)
+ create mode 100644 hw/i386/x86_dt_common.c
+ create mode 100644 hw/i386/x86_dt_common.h
+
+diff --git a/hw/i386/Kconfig b/hw/i386/Kconfig
+index e27d8816e5..d48b9b25e1 100644
+--- a/hw/i386/Kconfig
++++ b/hw/i386/Kconfig
+@@ -17,6 +17,8 @@ config TDX
+ 
+ config PC
+     bool
++    select DEVICE_TREE
++    depends on FDT
+     imply APPLESMC
+     imply HYPERV
+     imply ISA_IPMI_KCS
+diff --git a/hw/i386/meson.build b/hw/i386/meson.build
+index b611fbb5a7..ec867d48f3 100644
+--- a/hw/i386/meson.build
++++ b/hw/i386/meson.build
+@@ -29,6 +29,7 @@ stub_ss.add(files('sgx-hmp-stub.c'))
+ i386_ss.add(when: 'CONFIG_ACPI', if_true: files('acpi-common.c'))
+ i386_ss.add(when: 'CONFIG_PC', if_true: files(
+   'x86-common.c',
++  'x86_dt_common.c',
+   'pc.c',
+   'pc_sysfw.c',
+   'acpi-build.c',
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index f064aa2b3e..47be84a0d9 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -68,6 +68,7 @@
+ #include "trace.h"
+ #include "sev.h"
+ #include CONFIG_DEVICES
++#include "x86_dt_common.h"
+ 
+ #ifdef CONFIG_XEN_EMU
+ #include "hw/xen/xen-legacy-backend.h"
+@@ -526,6 +527,7 @@ void pc_machine_done(Notifier *notifier, void *data)
+     PCMachineState *pcms = container_of(notifier,
+                                         PCMachineState, machine_done);
+     X86MachineState *x86ms = X86_MACHINE(pcms);
++    MachineState *machine = MACHINE(pcms);
+ 
+     cxl_hook_up_pxb_registers(pcms->pcibus, &pcms->cxl_devices_state,
+                               &error_fatal);
+@@ -550,6 +552,9 @@ void pc_machine_done(Notifier *notifier, void *data)
+     }
+ 
+     pc_cmos_init_late(pcms);
++    if (x86ms->igvm) {
++        dt_setup_x86(machine);
++    }
+ }
+ 
+ /* setup pci memory address space mapping into system address space */
+diff --git a/hw/i386/x86_dt_common.c b/hw/i386/x86_dt_common.c
+new file mode 100644
+index 0000000000..84027d0a4c
+--- /dev/null
++++ b/hw/i386/x86_dt_common.c
+@@ -0,0 +1,104 @@
++/*
++ * x86 device tree generation for device plane filtering
++ *
++ * Generate a flattened device tree describing devices that belong to
++ * non-guest planes (e.g. SVSM firmware plane).  The resulting FDT is
++ * passed to the firmware via IGVM so it can discover virtio-mmio
++ * assigned to its plane.
++ *
++ * The device tree is intentionally incomplete: CPUs and memory are
++ * not included as firmware obtains that information through other
++ * channels.
++ *
++ * Based on hw/i386/microvm-dt.c
++ *
++ * Copyright (c) Red Hat, Inc.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/cutils.h"
++#include "qemu/error-report.h"
++#include "qapi/error.h"
++#include "system/device_tree.h"
++#include "hw/core/sysbus.h"
++#include "hw/virtio/virtio-mmio.h"
++#include "qom/object.h"
++
++#include "x86_dt_common.h"
++#include <libfdt.h>
++
++
++static bool debug;
++
++static void dt_add_virtio(MachineState *ms, VirtIOMMIOProxy *mmio)
++{
++    SysBusDevice *dev = SYS_BUS_DEVICE(mmio);
++    VirtioBusState *mmio_virtio_bus = &mmio->bus;
++    BusState *mmio_bus = &mmio_virtio_bus->parent_obj;
++    VirtIODevice *vdev;
++    hwaddr base = dev->mmio[0].addr;
++    hwaddr size = 512;
++    char *nodename;
++    uint8_t plane;
++
++    if (QTAILQ_EMPTY(&mmio_bus->children)) {
++        return;
++    }
++
++    /* Get the plane property of the inner device */
++    vdev = virtio_bus_get_device(mmio_virtio_bus);
++    plane = object_property_get_int(OBJECT(vdev), "plane", &error_fatal);
++
++    nodename = g_strdup_printf("/virtio_mmio@%" PRIx64, base);
++    qemu_fdt_add_subnode(ms->fdt, nodename);
++    qemu_fdt_setprop_string(ms->fdt, nodename, "compatible", "virtio,mmio");
++
++    qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg", 2, base, 2, size);
++    qemu_fdt_setprop_cell(ms->fdt, nodename, "plane", plane);
++    qemu_fdt_setprop(ms->fdt, nodename, "dma-coherent", NULL, 0);
++    g_free(nodename);
++}
++
++static void dt_setup_sys_bus(MachineState *ms)
++{
++    BusState *bus;
++    BusChild *kid;
++    Object *obj;
++
++    bus = sysbus_get_default();
++
++    QTAILQ_FOREACH(kid, &bus->children, sibling) {
++        DeviceState *dev = kid->child;
++
++        /* virtio */
++        obj = object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MMIO);
++        if (obj) {
++            dt_add_virtio(ms, VIRTIO_MMIO(obj));
++            continue;
++        }
++
++        if (debug) {
++            fprintf(stderr, "%s: unhandled: %s type: %s\n", __func__,
++                    dev->canonical_path,
++                    object_get_typename(OBJECT(dev)));
++        }
++    }
++}
++
++void dt_setup_x86(MachineState *ms)
++{
++    int fdt_size = 0;
++
++    g_free(ms->fdt);
++    ms->fdt = create_device_tree(&fdt_size);
++
++    /* root node */
++    qemu_fdt_setprop_string(ms->fdt, "/", "compatible", "svsm");
++    qemu_fdt_setprop_cell(ms->fdt, "/", "#address-cells", 0x2);
++    qemu_fdt_setprop_cell(ms->fdt, "/", "#size-cells", 0x2);
++    qemu_fdt_setprop_cell(ms->fdt, "/", "device-plane", ms->device_plane);
++
++    dt_setup_sys_bus(ms);
++
++}
+diff --git a/hw/i386/x86_dt_common.h b/hw/i386/x86_dt_common.h
+new file mode 100644
+index 0000000000..ac128ab979
+--- /dev/null
++++ b/hw/i386/x86_dt_common.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef HW_I386_X86_DT_COMMON_H
++#define HW_I386_X86_DT_COMMON_H
++
++#include "hw/core/boards.h"
++
++void dt_setup_x86(MachineState *ms);
++
++#endif
+-- 
+2.55.0
+

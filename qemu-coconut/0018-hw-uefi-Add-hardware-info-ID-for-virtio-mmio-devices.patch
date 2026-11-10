@@ -1,0 +1,30 @@
+From 36d029e321c724a81d58d00b0d9602b92d357933 Mon Sep 17 00:00:00 2001
+From: Oliver Steffen <osteffen@redhat.com>
+Date: Tue, 1 Jul 2025 14:18:14 +0200
+Subject: [PATCH 18/20] hw/uefi: Add hardware-info ID for virtio mmio devices
+ for SVSM
+
+Add a hardware-info device ID for virtio mmio devices intended for use by an SVSM.
+The ID has already been reserved in edk2, see edk2 commit f25e3d0d2c55.
+
+Signed-off-by: Oliver Steffen <osteffen@redhat.com>
+Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+---
+ include/hw/uefi/hardware-info.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/hw/uefi/hardware-info.h b/include/hw/uefi/hardware-info.h
+index 94c38cff20..d688af0e8a 100644
+--- a/include/hw/uefi/hardware-info.h
++++ b/include/hw/uefi/hardware-info.h
+@@ -14,6 +14,7 @@ typedef enum {
+     HardwareInfoTypeUndefined  = 0,
+     HardwareInfoTypeHostBridge = 1,
+     HardwareInfoQemuUefiVars   = 2,
++    HardwareInfoVirtioMmioSvsm = 0x1000,
+ } HARDWARE_INFO_TYPE;
+ 
+ typedef struct {
+-- 
+2.55.0
+

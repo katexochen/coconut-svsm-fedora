@@ -1,0 +1,113 @@
+From 5c1c05b2c3aa0dd1248e0cf58e401626e30887f8 Mon Sep 17 00:00:00 2001
+From: Gerd Hoffmann <kraxel@redhat.com>
+Date: Tue, 1 Jul 2025 14:18:15 +0200
+Subject: [PATCH 19/20] q35: add virtio-mmio slots
+
+Add virtio-mmio slots to the q35 machine model, intended to be used by
+an SVSM.
+
+Disabled by default, enable using '-machine q35,x-svsm-virtio-mmio=on'.
+
+When enabled it is possible to plug up to 4 virtio devices into the
+slots virtio-mmio using '-device virtio-${kind}-device'.
+
+The devices can be found at base address 0xfef00000, each slot on a
+separate page.  No IRQ is wired up, the SVSM has to drive the devices
+in polling mode.
+
+The base addresses are communicated to the SVSM via the etc/hardware-info
+fw_cfg file.
+
+Signed-off-by: Gerd Hoffmann <kraxel@redhat.com>
+Signed-off-by: Oliver Steffen <osteffen@redhat.com>
+---
+ hw/i386/pc.c         | 18 +++++++++++++++++-
+ hw/i386/pc_q35.c     | 15 +++++++++++++++
+ include/hw/i386/pc.h |  1 +
+ 3 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 47be84a0d9..96c2f581ff 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -1540,6 +1540,21 @@ static void pc_machine_set_smbios_ep(Object *obj, Visitor *v, const char *name,
+     visit_type_SmbiosEntryPointType(v, name, &pcms->smbios_entry_point_type, errp);
+ }
+ 
++static bool pc_machine_get_svsm_virtio_mmio(Object *obj, Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++
++    return pcms->svsm_virtio_mmio;
++}
++
++static void pc_machine_set_svsm_virtio_mmio(Object *obj, bool value,
++                                            Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++
++    pcms->svsm_virtio_mmio = value;
++}
++
+ static void pc_machine_get_max_ram_below_4g(Object *obj, Visitor *v,
+                                             const char *name, void *opaque,
+                                             Error **errp)
+@@ -1790,7 +1805,8 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
+                                           "Set IGVM configuration");
+ #endif
+ 
+-
++    object_class_property_add_bool(oc, "x-svsm-virtio-mmio",
++        pc_machine_get_svsm_virtio_mmio, pc_machine_set_svsm_virtio_mmio);
+ }
+ 
+ static const TypeInfo pc_machine_info = {
+diff --git a/hw/i386/pc_q35.c b/hw/i386/pc_q35.c
+index 6c1e4eff5f..c773f45d49 100644
+--- a/hw/i386/pc_q35.c
++++ b/hw/i386/pc_q35.c
+@@ -62,7 +62,9 @@
+ #include "hw/mem/nvdimm.h"
+ #include "hw/uefi/var-service-api.h"
+ #include "hw/i386/acpi-build.h"
++#include "hw/uefi/hardware-info.h"
+ #include "target/i386/cpu.h"
++#include "exec/target_page.h"
+ 
+ /* ICH9 AHCI has 6 ports */
+ #define MAX_SATA_PORTS     6
+@@ -329,6 +331,19 @@ static void pc_q35_init(MachineState *machine)
+                                x86_nvdimm_acpi_dsmio,
+                                x86ms->fw_cfg, OBJECT(pcms));
+     }
++
++    if (pcms->svsm_virtio_mmio) {
++        for (int dev = 0; dev < 4; dev++) {
++            HARDWARE_INFO_SIMPLE_DEVICE hwinfo = {
++                .mmio_address = cpu_to_le64(0xfef00000 + dev * TARGET_PAGE_SIZE),
++            };
++            sysbus_create_simple("virtio-mmio", hwinfo.mmio_address,
++                                 /* no irq */ NULL);
++            hardware_info_register(HardwareInfoVirtioMmioSvsm,
++                                   &hwinfo, sizeof(hwinfo));
++        }
++    }
++
+ }
+ 
+ static bool pc_q35_machine_get_wdat(Object *o, Error **errp)
+diff --git a/include/hw/i386/pc.h b/include/hw/i386/pc.h
+index d4b6d3ed57..1fc547fdce 100644
+--- a/include/hw/i386/pc.h
++++ b/include/hw/i386/pc.h
+@@ -52,6 +52,7 @@ typedef struct PCMachineState {
+     bool i8042_enabled;
+     bool default_bus_bypass_iommu;
+     bool fd_bootchk;
++    bool svsm_virtio_mmio;
+     uint64_t max_fw_size;
+ 
+     /* ACPI Memory hotplug IO base address */
+-- 
+2.55.0
+
