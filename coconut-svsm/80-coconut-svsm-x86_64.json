@@ -1,0 +1,11 @@
+{
+  "description": "COCONUT-SVSM with OVMF for AMD SEV-SNP (IGVM)",
+  "interface-types": ["uefi", "svsm"],
+  "mapping": {
+    "device": "igvm",
+    "filename": "/usr/share/coconut-svsm/coconut-qemu.igvm"
+  },
+  "targets": [{ "architecture": "x86_64", "machines": ["pc-q35-*"] }],
+  "features": ["amd-sev-snp"],
+  "tags": []
+}

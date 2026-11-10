@@ -1,0 +1,46 @@
+From ec6cd5ec323437c20ac13463f56fb6be37e27af1 Mon Sep 17 00:00:00 2001
+From: Paul Meyer <katexochen0@gmail.com>
+Date: Tue, 27 Oct 2026 15:37:22 +0100
+Subject: [PATCH] bldr: drop the 0x10000 offset from the SIPI GDT load
+
+The 16-bit SIPI entry code loads the GDT with
+
+    lgdtl %cs:0x10000 + gdt_desc - base_entry
+
+base_entry is linked at 0x10000, so the operand evaluates to 0x10008,
+the linear address of gdt_desc. In 16-bit mode the displacement field is
+16 bits wide though, and LLVM up to 22 silently truncated the value to
+0x0008, which is what the instruction needs: after the SIPI, %cs has a
+base of 0x10000, so the displacement must be the offset of gdt_desc
+inside the startup page.
+
+LLVM 23 rejects the truncation instead:
+
+    error: value of 65544 is too large for field of 2 bytes
+
+which breaks the build with Rust 1.99 as shipped by Fedora rawhide.
+Use the offset directly. The encoding (2e 66 0f 01 16 08 00) is
+identical to what older LLVM produced, so the generated code does not
+change.
+
+Signed-off-by: Paul Meyer <katexochen0@gmail.com>
+---
+ boot/bldr/src/main.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/boot/bldr/src/main.rs b/boot/bldr/src/main.rs
+index 8a90087..98a9b9e 100644
+--- a/boot/bldr/src/main.rs
++++ b/boot/bldr/src/main.rs
+@@ -64,7 +64,7 @@ global_asm!(
+         movl %cr0, %eax
+         orl ${CR0_PE}, %eax // enable protected mode
+         movl %eax, %cr0
+-        lgdtl %cs:0x10000 + gdt_desc - base_entry
++        lgdtl %cs:gdt_desc - base_entry
+         ljmpl $8, $startup_ap
+ 
+         .code32
+-- 
+2.56.0
+
