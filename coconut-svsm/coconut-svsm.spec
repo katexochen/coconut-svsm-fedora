@@ -31,7 +31,7 @@
 
 Name: coconut-svsm
 Version: v%{date}.devel
-Release: 4%{?dist}
+Release: 5%{?dist}
 Summary: The Coconut Secure VM Service Module for AMD SEV-SNP
 
 License: MIT AND Apache-2.0 AND BSD-2-Clause AND BSD-2-Clause-Patent AND BSD-3-Clause AND Unicode-3.0
@@ -183,5 +183,8 @@ install -D -m 755 scripts/launch_guest.sh %{buildroot}%{_bindir}/svsm-launch-gue
 %{_bindir}/svsm-launch-guest
 
 %changelog
+* Tue Nov 10 2026 Paul Meyer <katexochen0@gmail.com> - v2026.09.devel-5
+- Build from the packaging repository
+
 * Tue Nov 10 2026 Paul Meyer <katexochen0@gmail.com> - v2026.09.devel-4
 - Package v2026.09-devel for COPR, based on the Fedora review spec (bz#2541015)
